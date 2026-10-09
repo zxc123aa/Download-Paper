@@ -656,7 +656,9 @@ def main():
     ap = argparse.ArgumentParser(description="论文 PDF 批量下载 (直连+浏览器)")
     ap.add_argument("--csv", required=True, help="清单 CSV（含 记录ID/来源编号/DOI 等列）")
     ap.add_argument("--inbox", required=True, help="PDF 保存目录")
-    ap.add_argument("--phase", choices=["direct", "browser", "all"], default="all")
+    ap.add_argument("--phase", choices=["direct", "browser", "scihub", "all"],
+                    default="all",
+                    help="all = 直连 + 浏览器 + Sci-Hub（默认）")
     ap.add_argument("--resume", help="上次状态 CSV，跳过已 下载成功 的记录")
     ap.add_argument("--profile", default=None, help="Edge profile 目录（默认 ./edge_profile）")
     ap.add_argument("--challenge-wait", type=int, default=300,
@@ -697,6 +699,21 @@ def main():
                                                "edge_profile")
         results += phase_browser(todo, args.inbox, hashes, profile,
                                  challenge_wait=args.challenge_wait, delay=args.delay)
+
+    if args.phase in ("scihub", "all"):
+        todo = rows if args.phase == "scihub" else \
+            [r for r in rows
+             if not any(x["记录ID"] == r["记录ID"].strip()
+                        and x["状态"] == "下载成功" for x in results)]
+        if args.phase == "scihub" and args.resume:
+            have = {r["来源编号"].strip() for r in done.values()}
+            todo = [r for r in todo if r["来源编号"].strip() not in have]
+        print(f"== 阶段3: Sci-Hub ({len(todo)} 条) ==", flush=True)
+        try:
+            from scihub import phase_scihub
+            results += phase_scihub(todo, args.inbox, hashes, delay=args.delay)
+        except ImportError:
+            print("  ! scihub.py 不存在, 跳过 Sci-Hub 阶段", flush=True)
 
     # 合并 resume 结果并写出状态（保留旧文件中本次未涉及记录的状态, 防小样本测试覆盖）
     results = list(done.values()) + results

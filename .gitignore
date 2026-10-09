@@ -1,7 +1,5 @@
+_inbox/
+_inbox.zip
 edge_profile/
-dl_tmp/
+*.log
 __pycache__/
-*.pyc
-下载状态_输出.csv
-.gh_token
-device_code.json
