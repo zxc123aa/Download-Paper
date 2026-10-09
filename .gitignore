@@ -3,3 +3,5 @@ _inbox.zip
 edge_profile/
 *.log
 __pycache__/
+.gh_token
+device_code.json
