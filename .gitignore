@@ -3,3 +3,5 @@ dl_tmp/
 __pycache__/
 *.pyc
 下载状态_输出.csv
+.gh_token
+device_code.json
