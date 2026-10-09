@@ -206,18 +206,66 @@ def phase_direct(rows, inbox, hashes):
 
 # ---------------------------------------------------------------- 阶段2: 浏览器
 
-def phase_browser(rows, inbox, hashes, profile_dir):
+def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.0):
     from playwright.sync_api import sync_playwright
 
     def is_challenge(page):
         t = (page.title() or "").lower()
         return any(k in t for k in CHALLENGE_TITLES)
 
-    def wait_clear(page, sec=45):
+    def human_click(page, x, y):
+        import random
+        cx, cy = random.randint(200, 900), random.randint(150, 500)
+        page.mouse.move(cx, cy)
+        page.mouse.move((cx + x) // 2 + random.randint(-30, 30),
+                        (cy + y) // 2 + random.randint(-30, 30), steps=12)
+        time.sleep(random.uniform(0.1, 0.35))
+        page.mouse.move(x + random.randint(-2, 2), y + random.randint(-2, 2), steps=8)
+        time.sleep(random.uniform(0.15, 0.5))
+        page.mouse.down()
+        time.sleep(random.uniform(0.05, 0.15))
+        page.mouse.up()
+
+    def try_autoclick(page):
+        """尽力自动点验证组件（Turnstile 偶尔能过；Radware 通常要人工）。"""
+        for fr in page.frames:
+            try:
+                if "challenges.cloudflare.com" in (fr.url or ""):
+                    el = fr.query_selector("input[type='checkbox'], .ctp-checkbox-label")
+                    if el:
+                        bb = el.bounding_box()
+                        if bb:
+                            human_click(page, bb["x"] + bb["width"] / 2,
+                                        bb["y"] + bb["height"] / 2)
+                            return True
+            except Exception:
+                pass
+        for sel in ("#challenge-form button", "button[value*='verify' i]"):
+            try:
+                el = page.query_selector(sel)
+                if el and el.is_visible():
+                    bb = el.bounding_box()
+                    if bb:
+                        human_click(page, bb["x"] + bb["width"] / 2,
+                                    bb["y"] + bb["height"] / 2)
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def wait_clear(page, sec=300):
+        """等人机验证放行：先自动点，点不动就提示人工，超时才放弃。
+        人工点掉后 cookie 会留在 profile，后续一般不再弹。"""
         end = time.time() + sec
+        notified = False
         while time.time() < end:
             if not is_challenge(page):
                 return True
+            if not notified:
+                print("  !! 人机验证已弹出 —— 请在 Edge 窗口中手动完成验证"
+                      f"（最多等 {sec}s，完成后自动继续）", flush=True)
+                notified = True
+            try_autoclick(page)
             time.sleep(3)
         return not is_challenge(page)
 
@@ -330,6 +378,7 @@ def phase_browser(rows, inbox, hashes, profile_dir):
             doi = rec.get("DOI", "").strip()
             try:
                 land, err = landing(page, rec, doi)
+                time.sleep(delay)
                 if err:
                     status = "需人工验证" if err == "challenge" else "无落地页"
                     results.append({"记录ID": rid_key, "来源编号": rec_id, "DOI": doi,
@@ -382,6 +431,10 @@ def main():
     ap.add_argument("--phase", choices=["direct", "browser", "all"], default="all")
     ap.add_argument("--resume", help="上次状态 CSV，跳过已 下载成功 的记录")
     ap.add_argument("--profile", default=None, help="Edge profile 目录（默认 ./edge_profile）")
+    ap.add_argument("--challenge-wait", type=int, default=300,
+                    help="人机验证等待人工点击的秒数（默认 300）")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="浏览器阶段每条记录之间的间隔秒数（默认 2，共享 IP 建议调大）")
     args = ap.parse_args()
 
     os.makedirs(args.inbox, exist_ok=True)
@@ -414,7 +467,8 @@ def main():
         print(f"== 阶段2: 浏览器 ({len(todo)} 条) ==", flush=True)
         profile = args.profile or os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                "edge_profile")
-        results += phase_browser(todo, args.inbox, hashes, profile)
+        results += phase_browser(todo, args.inbox, hashes, profile,
+                                 challenge_wait=args.challenge_wait, delay=args.delay)
 
     # 合并 resume 结果并写出状态
     results = list(done.values()) + results
