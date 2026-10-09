@@ -27,7 +27,8 @@ UA_HDRS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 EMAIL = "ladia.research@outlook.com"
-CHALLENGE_TITLES = ("captcha", "just a moment", "client challenge", "attention required")
+CHALLENGE_TITLES = ("captcha", "just a moment", "client challenge",
+                    "attention required", "请稍候", "正在验证", "安全检查")
 PAYWALL = re.compile(
     r"purchase pdf|sign in to|subscribe to|access through your institution|"
     r"buy article|add to cart|login required|institutional login", re.I)
@@ -227,17 +228,18 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
         page.mouse.up()
 
     def try_autoclick(page):
-        """尽力自动点验证组件（Turnstile 偶尔能过；Radware 通常要人工）。"""
+        """尽力自动点验证组件（Turnstile 偶尔能过；Radware 通常要人工）。
+        Turnstile checkbox 在 shadow DOM 里, 元素选择器找不到 ——
+        用 CF frame_element 的 bounding_box 坐标点击（widget 左侧约 28px 处）。"""
         for fr in page.frames:
             try:
                 if "challenges.cloudflare.com" in (fr.url or ""):
-                    el = fr.query_selector("input[type='checkbox'], .ctp-checkbox-label")
-                    if el:
-                        bb = el.bounding_box()
-                        if bb:
-                            human_click(page, bb["x"] + bb["width"] / 2,
-                                        bb["y"] + bb["height"] / 2)
-                            return True
+                    fel = fr.frame_element()
+                    bb = fel.bounding_box()
+                    if bb and bb["width"] >= 20:
+                        human_click(page, bb["x"] + 28,
+                                    bb["y"] + bb["height"] / 2)
+                        return True
             except Exception:
                 pass
         for sel in ("#challenge-form button", "button[value*='verify' i]"):
@@ -273,25 +275,167 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
         try:
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             return True
+        except Exception as e:
+            # 窗口被关必须上抛, 让外层重建 page 恢复; 其余错误记日志返回 False
+            if "TargetClosed" in type(e).__name__:
+                raise
+            print(f"    [goto fail] {url[:80]} -> {type(e).__name__}: "
+                  f"{str(e).replace(chr(10), ' ')[:120]}", flush=True)
+            return False
+
+    def is_robot_sd(page):
+        """ScienceDirect/CF 的 'Are you a robot' 页 title 不含关键词, 须查 body。"""
+        try:
+            b = (page.evaluate(
+                "document.body ? document.body.innerText.slice(0,600) : ''") or "").lower()
+            return ("are you a robot" in b or "captcha" in b or "请验证" in b)
         except Exception:
             return False
+
+    SD_FETCH_JS = """async (u) => {
+      try {
+        const r = await fetch(u, {credentials: "include"});
+        const ct = r.headers.get("content-type") || "";
+        if (!/pdf/i.test(ct)) return null;
+        const buf = await r.arrayBuffer();
+        let bin = ""; const bytes = new Uint8Array(buf);
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk)
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        return btoa(bin);
+      } catch (e) { return null; }
+    }"""
+
+    def elsevier_pdf_flow(page, u):
+        """ScienceDirect pdfft 链路（fetch 必被 CF JS challenge 拦, 仅放行浏览器导航）。
+        注意: 调用点 page 可能已是半死的 PDF viewer 页 —— 一律新开 page 跑流程。
+        goto pdfft?download=true -> challenge -> 自动/人工过验证
+        -> 浏览器继续导航 -> 响应 attachment 触发原生下载 -> ctx download 捕获。
+        兜底: 到 viewer 后同源 fetch signed URL。"""
+        u2 = u.replace("&download=true", "").replace("?download=true", "")
+        u2 += ("&download=true" if "?" in u2 else "?download=true")
+        dl_box = []
+        def _on_dl(d):
+            dl_box.append(d)
+        ctx.on("download", _on_dl)
+        pg = ctx.new_page()
+        try:
+            try:
+                pg.goto(u2, timeout=45000, wait_until="domcontentloaded")
+                print(f"    [sd] goto ok -> {pg.url[:90]}", flush=True)
+            except Exception as e:
+                print(f"    [sd goto] {type(e).__name__}", flush=True)
+            signed = None
+            end = time.time() + challenge_wait
+            notified = False
+            tick = 0
+            while time.time() < end:
+                tick += 1
+                if dl_box:
+                    print(f"    [sd] 下载事件 x{len(dl_box)}, 保存中", flush=True)
+                    try:
+                        tmp = os.path.join(inbox,
+                                           "_sd_dl_" + dl_box[0].suggested_filename)
+                        dl_box[0].save_as(tmp)
+                        body = open(tmp, "rb").read()
+                        os.remove(tmp)
+                        if body[:5] == b"%PDF-":
+                            return body
+                        print(f"    [sd] 下载内容非PDF: {body[:20]}", flush=True)
+                    except Exception as e:
+                        print(f"    [sd] 下载保存失败 {type(e).__name__}", flush=True)
+                try:
+                    cu = pg.url
+                except Exception as e:
+                    cu = f"<dead:{type(e).__name__}>"
+                if "sciencedirectassets.com" in cu and not is_robot_sd(pg):
+                    signed = cu
+                    break
+                if is_robot_sd(pg):
+                    if not notified:
+                        print("  !! ScienceDirect PDF 验证页 —— 请在 Edge 窗口勾选"
+                              "（脚本也在自动尝试）", flush=True)
+                        notified = True
+                    try_autoclick(pg)
+                if tick % 5 == 0:
+                    print(f"    [sd] t={tick*3}s url={str(cu)[:80]} dl={len(dl_box)}",
+                          flush=True)
+                time.sleep(3)
+            if not signed:
+                return None
+            time.sleep(1.5)
+            try:
+                b64 = pg.evaluate(SD_FETCH_JS, [signed])
+                if b64:
+                    return base64.b64decode(b64)
+            except Exception:
+                pass
+            return None
+        finally:
+            try:
+                pg.close()
+            except Exception:
+                pass
+
+    def elsevier_cands(doi):
+        """Elsevier: doi.org 跳转被反爬 ERR_ABORTED，改为 requests 解析 PII 后直奔
+        sciencedirect 文章页。注意: 只给文章页, 绝不给 pdfft —— goto pdfft 会把
+        页面转成内置 PDF viewer / 触发下载, 直接搞死 Playwright context。"""
+        try:
+            import requests as _rq
+            r = _rq.get(f"https://doi.org/{doi}", timeout=25, allow_redirects=True,
+                        headers={"User-Agent": UA_HDRS["User-Agent"]})
+            m = re.search(r"/pii/([A-Za-z0-9]+)", r.url, re.I)
+            if m:
+                pii = m.group(1)
+                # 只要文章页 —— pdfft 直链会让 landing 阶段把 page 变成 viewer
+                return [f"https://www.sciencedirect.com/science/article/pii/{pii}"]
+        except Exception:
+            pass
+        return []
+
+    def s2_oa_cands(rec):
+        """无DOI记录: 从 Semantic Scholar 存档入口提取 paper id, API 查 OA PDF 直链。"""
+        arc = (rec.get("无DOI存档入口") or "")
+        m = re.search(r"semanticscholar\.org/paper/([0-9a-f]{40})", arc)
+        if not m:
+            return []
+        try:
+            import requests as _rq
+            r = _rq.get(f"https://api.semanticscholar.org/graph/v1/paper/{m.group(1)}"
+                        f"?fields=openAccessPdf", timeout=20)
+            if r.status_code == 200:
+                pdf = (r.json().get("openAccessPdf") or {}).get("url")
+                return [pdf] if pdf else []
+        except Exception:
+            pass
+        return []
 
     def landing(page, rec, doi):
         cands = []
         if doi:
+            if doi.startswith("10.1016/"):
+                cands.extend(elsevier_cands(doi))
             cands.append("https://doi.org/" + doi)
             if doi.startswith("10.1088/"):
                 cands.append(f"https://iopscience.iop.org/article/{doi}")
+        arc = (rec.get("无DOI存档入口") or "").strip()
+        if arc.startswith("http"):
+            cands.append(arc)
+        cands.extend(s2_oa_cands(rec))
         for u in candidate_urls(rec):
             if "/pdf" not in u.lower() and "arxiv" not in u:
                 cands.append(u)
+        last_err = None
         for cu in cands:
             if not safe_goto(page, cu):
                 continue
             if is_challenge(page) and not wait_clear(page):
                 return None, "challenge"
             if not safe_goto(page, cu):
-                continue
+                time.sleep(2)
+                if not safe_goto(page, cu):
+                    continue
             if is_challenge(page):
                 return None, "challenge"
             if any(k in (page.title() or "").lower() for k in CHALLENGE_TITLES):
@@ -312,7 +456,7 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                 urls.insert(0, meta.get_attribute("content"))
             for el in page.query_selector_all("a[href]"):
                 h = el.get_attribute("href") or ""
-                if re.search(r"\.pdf($|\?)|/pdf($|\?|/)|article-pdf|/docserver", h, re.I):
+                if re.search(r"\.pdf($|\?)|/pdf($|\?|/)|article-pdf|/docserver|stamp\.jsp|pdfft", h, re.I):
                     if h.startswith("/"):
                         pp = urlparse(page.url)
                         h = f"{pp.scheme}://{pp.netloc}{h}"
@@ -372,7 +516,38 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
             args=["--disable-blink-features=AutomationControlled"])
         page = ctx.new_page()
 
+        def relaunch():
+            """整个浏览器都没了 -> 重新拉起 persistent context（带重试）。"""
+            nonlocal ctx, page
+            try:
+                ctx.close()
+            except Exception:
+                pass
+            for attempt in range(3):
+                try:
+                    ctx = p.chromium.launch_persistent_context(
+                        profile_dir, channel="msedge", headless=False,
+                        viewport={"width": 1400, "height": 900}, accept_downloads=True,
+                        args=["--disable-blink-features=AutomationControlled"])
+                    page = ctx.new_page()
+                    print("  ~~ 浏览器已重新启动, 继续跑", flush=True)
+                    return
+                except Exception as e:
+                    print(f"  ~~ 重启失败({attempt+1}/3): {type(e).__name__}, 3s 后重试",
+                          flush=True)
+                    time.sleep(3)
+            raise RuntimeError("浏览器重启 3 次均失败")
+
         for i, rec in enumerate(rows):
+            # 窗口/浏览器自愈: page 死了建 page, 建不了才整个重启
+            try:
+                if page.is_closed():
+                    page = ctx.new_page()
+            except Exception:
+                try:
+                    page = ctx.new_page()
+                except Exception:
+                    relaunch()
             rid_key = rec["记录ID"].strip()
             rec_id = rec["来源编号"].strip()
             doi = rec.get("DOI", "").strip()
@@ -387,7 +562,40 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                     continue
                 body = None
                 used = ""
-                for u in pdf_urls(page, rec, doi):
+                pdf_cand = pdf_urls(page, rec, doi)
+                # Elsevier: 含本文 PII 的链接排最前(页面上还有推荐文章的 pdf 链接)
+                if doi.startswith("10.1016/"):
+                    m_pii = re.search(r"/pii/([A-Za-z0-9]+)", str(land) or "", re.I)
+                    if m_pii:
+                        _pii = m_pii.group(1)
+                        pdf_cand.sort(key=lambda x: 0 if _pii in x else 1)
+                    for cu in elsevier_cands(doi):
+                        if cu not in pdf_cand:
+                            pdf_cand.append(cu)
+                for u in pdf_cand:
+                    # IEEE stamp.jsp 是 HTML 中转页: 先跳过去, 从 iframe 抠真正的 iel*.pdf
+                    if "stamp.jsp" in u:
+                        if not safe_goto(page, u):
+                            continue
+                        time.sleep(1.5)
+                        try:
+                            fr = page.query_selector("iframe[src*='getPDF'], iframe[src*='.pdf'], iframe[src*='iel'], iframe#pdf") or page.query_selector("iframe[src]")
+                            src = fr.get_attribute("src") if fr else ""
+                            if src and src.startswith("/"):
+                                pp = urlparse(page.url)
+                                src = f"{pp.scheme}://{pp.netloc}{src}"
+                            if src:
+                                u = src
+                        except Exception:
+                            pass
+                    # ScienceDirect pdfft: 专用链路 —— 绝不能让 try_anchor/try_fetch
+                    # 碰它(导航到 viewer 会杀死整个 persistent context)
+                    if "sciencedirect.com" in u and ("pdfft" in u or "/pdf?" in u):
+                        body = elsevier_pdf_flow(page, u)
+                        if body:
+                            used = u
+                            break
+                        continue
                     body = try_fetch(page, u) or try_anchor(page, u) or try_ctx_ua(ctx, page, u)
                     if body:
                         used = u
@@ -404,14 +612,15 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                     status = "付费墙_无公开权限" if PAYWALL.search(html) else "未找到PDF入口"
                     h, used = "", land
             except Exception as e:
-                # 浏览器页崩溃恢复: 重建 page 继续，不再连坐失败
+                # 浏览器页崩溃恢复: 重建 page/浏览器继续，不再连坐失败
+                import traceback
+                traceback.print_exc()
                 name = type(e).__name__
                 if "TargetClosed" in name:
                     try:
-                        page.close()
+                        relaunch()
                     except Exception:
                         pass
-                    page = ctx.new_page()
                 status = f"error:{name}"
                 h, used = "", ""
             results.append({"记录ID": rid_key, "来源编号": rec_id, "DOI": doi,
