@@ -573,14 +573,19 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                         if cu not in pdf_cand:
                             pdf_cand.append(cu)
                 # Wiley/MedPhys: /doi/pdfdirect/{DOI}?download=true 同源 fetch 直出
-                # application/pdf（/doi/pdf 是 Edge viewer 壳页拿不到字节）
+                # application/pdf（/doi/pdf 是 Edge viewer 壳页拿不到字节）。
+                # 10.1002 的 mp.* 期刊在 aapm 子域, 其他在主域; aapm 优先。
+                # 只用页内 fetch —— try_anchor 会导航跨域毁掉同源上下文
+                wiley_direct = []
                 if doi.startswith(("10.1118/", "10.1002/")):
-                    host = ("aapm.onlinelibrary.wiley.com"
-                            if doi.startswith("10.1118/")
-                            else "onlinelibrary.wiley.com")
-                    wu = f"https://{host}/doi/pdfdirect/{doi}?download=true"
-                    if wu not in pdf_cand:
-                        pdf_cand.append(wu)
+                    hosts = ["aapm.onlinelibrary.wiley.com",
+                             "onlinelibrary.wiley.com"]
+                    for host in hosts:
+                        wu = f"https://{host}/doi/pdfdirect/{doi}?download=true"
+                        if wu not in wiley_direct:
+                            wiley_direct.append(wu)
+                    pdf_cand = wiley_direct + [u for u in pdf_cand
+                                               if "pdfdirect" not in u]
                 for u in pdf_cand:
                     # IEEE stamp.jsp 是 HTML 中转页: 先跳过去, 从 iframe 抠真正的 iel*.pdf
                     if "stamp.jsp" in u:
@@ -606,6 +611,11 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                             break
                         continue
                     body = try_fetch(page, u) or try_anchor(page, u) or try_ctx_ua(ctx, page, u)
+                    if "pdfdirect" in u and not body:
+                        # pdfdirect 只走页内 fetch, anchor/ctx 导航会毁同源上下文
+                        body = None
+                        if "wiley" in u:
+                            continue
                     if body:
                         used = u
                         break
