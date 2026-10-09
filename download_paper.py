@@ -572,6 +572,15 @@ def phase_browser(rows, inbox, hashes, profile_dir, challenge_wait=300, delay=2.
                     for cu in elsevier_cands(doi):
                         if cu not in pdf_cand:
                             pdf_cand.append(cu)
+                # Wiley/MedPhys: /doi/pdfdirect/{DOI}?download=true 同源 fetch 直出
+                # application/pdf（/doi/pdf 是 Edge viewer 壳页拿不到字节）
+                if doi.startswith(("10.1118/", "10.1002/")):
+                    host = ("aapm.onlinelibrary.wiley.com"
+                            if doi.startswith("10.1118/")
+                            else "onlinelibrary.wiley.com")
+                    wu = f"https://{host}/doi/pdfdirect/{doi}?download=true"
+                    if wu not in pdf_cand:
+                        pdf_cand.append(wu)
                 for u in pdf_cand:
                     # IEEE stamp.jsp 是 HTML 中转页: 先跳过去, 从 iframe 抠真正的 iel*.pdf
                     if "stamp.jsp" in u:
