@@ -698,10 +698,17 @@ def main():
         results += phase_browser(todo, args.inbox, hashes, profile,
                                  challenge_wait=args.challenge_wait, delay=args.delay)
 
-    # 合并 resume 结果并写出状态
+    # 合并 resume 结果并写出状态（保留旧文件中本次未涉及记录的状态, 防小样本测试覆盖）
     results = list(done.values()) + results
     status_path = os.path.join(os.path.dirname(os.path.abspath(args.csv)),
                                "下载状态_输出.csv")
+    seen_ids = {x["记录ID"] for x in results}
+    if os.path.exists(status_path) and \
+            os.path.abspath(status_path) != os.path.abspath(args.csv):
+        for r in read_rows(status_path):
+            if r.get("记录ID", "").strip() not in seen_ids:
+                results.append(r)
+                seen_ids.add(r.get("记录ID", "").strip())
     fields = ["记录ID", "来源编号", "DOI", "状态", "入口", "sha256"]
     with open(status_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
